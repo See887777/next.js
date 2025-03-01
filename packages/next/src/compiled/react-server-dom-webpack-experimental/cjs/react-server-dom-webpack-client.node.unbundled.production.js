@@ -14,15 +14,15 @@ var util = require("util"),
   decoderOptions = { stream: !0 };
 function resolveClientReference(bundlerConfig, metadata) {
   var moduleExports = bundlerConfig[metadata[0]];
-  if ((bundlerConfig = moduleExports[metadata[2]]))
+  if ((bundlerConfig = moduleExports && moduleExports[metadata[2]]))
     moduleExports = bundlerConfig.name;
   else {
-    bundlerConfig = moduleExports["*"];
+    bundlerConfig = moduleExports && moduleExports["*"];
     if (!bundlerConfig)
       throw Error(
         'Could not find the module "' +
           metadata[0] +
-          '" in the React SSR Manifest. This is probably a bug in the React Server Components bundler.'
+          '" in the React Server Consumer Manifest. This is probably a bug in the React Server Components bundler.'
       );
     moduleExports = metadata[2];
   }
@@ -31,6 +31,12 @@ function resolveClientReference(bundlerConfig, metadata) {
     name: moduleExports,
     async: 4 === metadata.length
   };
+}
+function resolveServerReference(bundlerConfig, id) {
+  var idx = id.lastIndexOf("#");
+  bundlerConfig = id.slice(0, idx);
+  id = id.slice(idx + 1);
+  return { specifier: bundlerConfig, name: id };
 }
 var asyncModuleCache = new Map();
 function preloadModule(metadata) {
@@ -56,6 +62,16 @@ function preloadModule(metadata) {
   );
   asyncModuleCache.set(metadata.specifier, modulePromise);
   return modulePromise;
+}
+function requireModule(metadata) {
+  var moduleExports = asyncModuleCache.get(metadata.specifier);
+  if ("fulfilled" === moduleExports.status) moduleExports = moduleExports.value;
+  else throw moduleExports.reason;
+  return "*" === metadata.name
+    ? moduleExports
+    : "" === metadata.name
+      ? moduleExports.default
+      : moduleExports[metadata.name];
 }
 function prepareDestinationWithChunks(moduleLoading, chunks, nonce$jscomp$0) {
   if (null !== moduleLoading)
@@ -382,7 +398,7 @@ function processReply(
       ) {
         if (void 0 === temporaryReferences)
           throw Error(
-            "Only plain objects, and a few built-ins, can be passed to Server Actions. Classes or null prototypes are not supported."
+            "Only plain objects, and a few built-ins, can be passed to Server Functions. Classes or null prototypes are not supported."
           );
         return "$T";
       }
@@ -454,12 +470,17 @@ function processReply(
     pendingParts = 0,
     formData = null,
     writtenObjects = new WeakMap(),
-    modelRoot = root;
-  root = serializeModel(root, 0);
+    modelRoot = root,
+    json = serializeModel(root, 0);
   null === formData
-    ? resolve(root)
-    : (formData.set(formFieldPrefix + "0", root),
+    ? resolve(json)
+    : (formData.set(formFieldPrefix + "0", json),
       0 === pendingParts && resolve(formData));
+  return function () {
+    0 < pendingParts &&
+      ((pendingParts = 0),
+      null === formData ? resolve(json) : resolve(formData));
+  };
 }
 var boundCache = new WeakMap();
 function encodeFormData(reference) {
@@ -598,22 +619,38 @@ function bind() {
   }
   return newFn;
 }
+function createBoundServerReference(metaData, callServer, encodeFormAction) {
+  function action() {
+    var args = Array.prototype.slice.call(arguments);
+    return bound
+      ? "fulfilled" === bound.status
+        ? callServer(id, bound.value.concat(args))
+        : Promise.resolve(bound).then(function (boundArgs) {
+            return callServer(id, boundArgs.concat(args));
+          })
+      : callServer(id, args);
+  }
+  var id = metaData.id,
+    bound = metaData.bound;
+  registerServerReference(action, { id: id, bound: bound }, encodeFormAction);
+  return action;
+}
 function createServerReference$1(id, callServer, encodeFormAction) {
-  function proxy() {
+  function action() {
     var args = Array.prototype.slice.call(arguments);
     return callServer(id, args);
   }
-  registerServerReference(proxy, { id: id, bound: null }, encodeFormAction);
-  return proxy;
+  registerServerReference(action, { id: id, bound: null }, encodeFormAction);
+  return action;
 }
-function Chunk(status, value, reason, response) {
+function ReactPromise(status, value, reason, response) {
   this.status = status;
   this.value = value;
   this.reason = reason;
   this._response = response;
 }
-Chunk.prototype = Object.create(Promise.prototype);
-Chunk.prototype.then = function (resolve, reject) {
+ReactPromise.prototype = Object.create(Promise.prototype);
+ReactPromise.prototype.then = function (resolve, reject) {
   switch (this.status) {
     case "resolved_model":
       initializeModelChunk(this);
@@ -655,7 +692,10 @@ function readChunk(chunk) {
   }
 }
 function createPendingChunk(response) {
-  return new Chunk("pending", null, null, response);
+  return new ReactPromise("pending", null, null, response);
+}
+function createErrorChunk(response, error) {
+  return new ReactPromise("rejected", null, error, response);
 }
 function wakeChunk(listeners, value) {
   for (var i = 0; i < listeners.length; i++) (0, listeners[i])(value);
@@ -696,7 +736,7 @@ function triggerErrorOnChunk(chunk, error) {
   }
 }
 function createResolvedIteratorResultChunk(response, value, done) {
-  return new Chunk(
+  return new ReactPromise(
     "resolved_model",
     (done ? '{"done":true,"value":' : '{"done":false,"value":') + value + "}",
     null,
@@ -765,23 +805,16 @@ function initializeModelChunk(chunk) {
 }
 function initializeModuleChunk(chunk) {
   try {
-    var metadata = chunk.value,
-      promise = asyncModuleCache.get(metadata.specifier);
-    if ("fulfilled" === promise.status) var moduleExports = promise.value;
-    else throw promise.reason;
-    var JSCompiler_inline_result =
-      "*" === metadata.name
-        ? moduleExports
-        : "" === metadata.name
-          ? moduleExports.default
-          : moduleExports[metadata.name];
+    var value = requireModule(chunk.value);
     chunk.status = "fulfilled";
-    chunk.value = JSCompiler_inline_result;
+    chunk.value = value;
   } catch (error) {
     (chunk.status = "rejected"), (chunk.reason = error);
   }
 }
 function reportGlobalError(response, error) {
+  response._closed = !0;
+  response._closedReason = error;
   response._chunks.forEach(function (chunk) {
     "pending" === chunk.status && triggerErrorOnChunk(chunk, error);
   });
@@ -792,7 +825,11 @@ function createLazyChunkWrapper(chunk) {
 function getChunk(response, id) {
   var chunks = response._chunks,
     chunk = chunks.get(id);
-  chunk || ((chunk = createPendingChunk(response)), chunks.set(id, chunk));
+  chunk ||
+    ((chunk = response._closed
+      ? createErrorChunk(response, response._closedReason)
+      : createPendingChunk(response)),
+    chunks.set(id, chunk));
   return chunk;
 }
 function waitForReference(
@@ -816,8 +853,19 @@ function waitForReference(
         }
       value = value[path[i]];
     }
-    parentObject[key] = map(response, value);
-    "" === key && null === handler.value && (handler.value = parentObject[key]);
+    i = map(response, value, parentObject, key);
+    parentObject[key] = i;
+    "" === key && null === handler.value && (handler.value = i);
+    if (
+      parentObject[0] === REACT_ELEMENT_TYPE &&
+      "object" === typeof handler.value &&
+      null !== handler.value &&
+      handler.value.$$typeof === REACT_ELEMENT_TYPE
+    )
+      switch (((value = handler.value), key)) {
+        case "3":
+          value.props = i;
+      }
     handler.deps--;
     0 === handler.deps &&
       ((i = handler.chunk),
@@ -852,21 +900,74 @@ function waitForReference(
   referencedChunk.then(fulfill, reject);
   return null;
 }
-function createServerReferenceProxy(response, metaData) {
-  function proxy() {
-    var args = Array.prototype.slice.call(arguments),
-      p = metaData.bound;
-    return p
-      ? "fulfilled" === p.status
-        ? callServer(metaData.id, p.value.concat(args))
-        : Promise.resolve(p).then(function (bound) {
-            return callServer(metaData.id, bound.concat(args));
-          })
-      : callServer(metaData.id, args);
-  }
-  var callServer = response._callServer;
-  registerServerReference(proxy, metaData, response._encodeFormAction);
-  return proxy;
+function loadServerReference(response, metaData, parentObject, key) {
+  if (!response._serverReferenceConfig)
+    return createBoundServerReference(
+      metaData,
+      response._callServer,
+      response._encodeFormAction
+    );
+  var serverReference = resolveServerReference(
+    response._serverReferenceConfig,
+    metaData.id
+  );
+  if ((response = preloadModule(serverReference)))
+    metaData.bound && (response = Promise.all([response, metaData.bound]));
+  else if (metaData.bound) response = Promise.resolve(metaData.bound);
+  else return requireModule(serverReference);
+  if (initializingHandler) {
+    var handler = initializingHandler;
+    handler.deps++;
+  } else
+    handler = initializingHandler = {
+      parent: null,
+      chunk: null,
+      value: null,
+      deps: 1,
+      errored: !1
+    };
+  response.then(
+    function () {
+      var resolvedValue = requireModule(serverReference);
+      if (metaData.bound) {
+        var boundArgs = metaData.bound.value.slice(0);
+        boundArgs.unshift(null);
+        resolvedValue = resolvedValue.bind.apply(resolvedValue, boundArgs);
+      }
+      parentObject[key] = resolvedValue;
+      "" === key && null === handler.value && (handler.value = resolvedValue);
+      if (
+        parentObject[0] === REACT_ELEMENT_TYPE &&
+        "object" === typeof handler.value &&
+        null !== handler.value &&
+        handler.value.$$typeof === REACT_ELEMENT_TYPE
+      )
+        switch (((boundArgs = handler.value), key)) {
+          case "3":
+            boundArgs.props = resolvedValue;
+        }
+      handler.deps--;
+      0 === handler.deps &&
+        ((resolvedValue = handler.chunk),
+        null !== resolvedValue &&
+          "blocked" === resolvedValue.status &&
+          ((boundArgs = resolvedValue.value),
+          (resolvedValue.status = "fulfilled"),
+          (resolvedValue.value = handler.value),
+          null !== boundArgs && wakeChunk(boundArgs, handler.value)));
+    },
+    function (error) {
+      if (!handler.errored) {
+        handler.errored = !0;
+        handler.value = error;
+        var chunk = handler.chunk;
+        null !== chunk &&
+          "blocked" === chunk.status &&
+          triggerErrorOnChunk(chunk, error);
+      }
+    }
+  );
+  return null;
 }
 function getOutlinedModel(response, reference, parentObject, key, map) {
   reference = reference.split(":");
@@ -882,10 +983,8 @@ function getOutlinedModel(response, reference, parentObject, key, map) {
   switch (id.status) {
     case "fulfilled":
       var value = id.value;
-      for (id = 1; id < reference.length; id++)
-        if (
-          ((value = value[reference[id]]), value.$$typeof === REACT_LAZY_TYPE)
-        )
+      for (id = 1; id < reference.length; id++) {
+        for (; value.$$typeof === REACT_LAZY_TYPE; )
           if (((value = value._payload), "fulfilled" === value.status))
             value = value.value;
           else
@@ -895,9 +994,11 @@ function getOutlinedModel(response, reference, parentObject, key, map) {
               key,
               response,
               map,
-              reference.slice(id)
+              reference.slice(id - 1)
             );
-      return map(response, value);
+        value = value[reference[id]];
+      }
+      return map(response, value, parentObject, key);
     case "pending":
     case "blocked":
       return waitForReference(id, parentObject, key, response, map, reference);
@@ -976,7 +1077,7 @@ function parseModelString(response, parentObject, key, value) {
             value,
             parentObject,
             key,
-            createServerReferenceProxy
+            loadServerReference
           )
         );
       case "T":
@@ -1007,6 +1108,8 @@ function parseModelString(response, parentObject, key, value) {
           (value = value.slice(2)),
           getOutlinedModel(response, value, parentObject, key, createFormData)
         );
+      case "Z":
+        return resolveErrorProd();
       case "i":
         return (
           (value = value.slice(2)),
@@ -1040,6 +1143,7 @@ function missingCall() {
 }
 function ResponseInstance(
   bundlerConfig,
+  serverReferenceConfig,
   moduleLoading,
   callServer,
   encodeFormAction,
@@ -1048,6 +1152,7 @@ function ResponseInstance(
 ) {
   var chunks = new Map();
   this._bundlerConfig = bundlerConfig;
+  this._serverReferenceConfig = serverReferenceConfig;
   this._moduleLoading = moduleLoading;
   this._callServer = void 0 !== callServer ? callServer : missingCall;
   this._encodeFormAction = encodeFormAction;
@@ -1057,6 +1162,8 @@ function ResponseInstance(
   this._fromJSON = null;
   this._rowLength = this._rowTag = this._rowID = this._rowState = 0;
   this._buffer = [];
+  this._closed = !1;
+  this._closedReason = null;
   this._tempRefs = temporaryReferences;
   this._fromJSON = createFromJSONCallback(this);
 }
@@ -1065,7 +1172,7 @@ function resolveBuffer(response, id, buffer) {
     chunk = chunks.get(id);
   chunk && "pending" !== chunk.status
     ? chunk.reason.enqueueValue(buffer)
-    : chunks.set(id, new Chunk("fulfilled", buffer, null, response));
+    : chunks.set(id, new ReactPromise("fulfilled", buffer, null, response));
 }
 function resolveModule(response, id, model) {
   var chunks = response._chunks,
@@ -1082,7 +1189,7 @@ function resolveModule(response, id, model) {
       var blockedChunk = chunk;
       blockedChunk.status = "blocked";
     } else
-      (blockedChunk = new Chunk("blocked", null, null, response)),
+      (blockedChunk = new ReactPromise("blocked", null, null, response)),
         chunks.set(id, blockedChunk);
     model.then(
       function () {
@@ -1097,7 +1204,7 @@ function resolveModule(response, id, model) {
       ? resolveModuleChunk(chunk, clientReference)
       : chunks.set(
           id,
-          new Chunk("resolved_module", clientReference, null, response)
+          new ReactPromise("resolved_module", clientReference, null, response)
         );
 }
 function resolveStream(response, id, stream, controller) {
@@ -1110,7 +1217,10 @@ function resolveStream(response, id, stream, controller) {
       (chunk.value = stream),
       (chunk.reason = controller),
       null !== response && wakeChunk(response, chunk.value))
-    : chunks.set(id, new Chunk("fulfilled", stream, controller, response));
+    : chunks.set(
+        id,
+        new ReactPromise("fulfilled", stream, controller, response)
+      );
 }
 function startReadableStream(response, id, type) {
   var controller = null;
@@ -1131,7 +1241,7 @@ function startReadableStream(response, id, type) {
     },
     enqueueModel: function (json) {
       if (null === previousBlockedChunk) {
-        var chunk = new Chunk("resolved_model", json, null, response);
+        var chunk = new ReactPromise("resolved_model", json, null, response);
         initializeModelChunk(chunk);
         "fulfilled" === chunk.status
           ? controller.enqueue(chunk.value)
@@ -1207,7 +1317,7 @@ function startAsyncIterable(response, id, iterator) {
           );
         if (nextReadIndex === buffer.length) {
           if (closed)
-            return new Chunk(
+            return new ReactPromise(
               "fulfilled",
               { done: !0, value: void 0 },
               null,
@@ -1226,7 +1336,7 @@ function startAsyncIterable(response, id, iterator) {
     {
       enqueueValue: function (value) {
         if (nextWriteIndex === buffer.length)
-          buffer[nextWriteIndex] = new Chunk(
+          buffer[nextWriteIndex] = new ReactPromise(
             "fulfilled",
             { done: !1, value: value },
             null,
@@ -1281,6 +1391,13 @@ function startAsyncIterable(response, id, iterator) {
       }
     }
   );
+}
+function resolveErrorProd() {
+  var error = Error(
+    "An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error."
+  );
+  error.stack = "Error: " + error.message;
+  return error;
 }
 function mergeBuffer(buffer, lastChunk) {
   for (var l = buffer.length, byteLength = lastChunk.length, i = 0; i < l; i++)
@@ -1418,24 +1535,22 @@ function processFullStringRow(response, id, tag, row) {
       }
       break;
     case 69:
-      tag = JSON.parse(row).digest;
-      row = Error(
-        "An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error."
-      );
-      row.stack = "Error: " + row.message;
-      row.digest = tag;
+      tag = JSON.parse(row);
+      row = resolveErrorProd();
+      row.digest = tag.digest;
       tag = response._chunks;
       var chunk = tag.get(id);
       chunk
         ? triggerErrorOnChunk(chunk, row)
-        : tag.set(id, new Chunk("rejected", null, row, response));
+        : tag.set(id, createErrorChunk(response, row));
       break;
     case 84:
       tag = response._chunks;
       (chunk = tag.get(id)) && "pending" !== chunk.status
         ? chunk.reason.enqueueValue(row)
-        : tag.set(id, new Chunk("fulfilled", row, null, response));
+        : tag.set(id, new ReactPromise("fulfilled", row, null, response));
       break;
+    case 78:
     case 68:
     case 87:
       throw Error(
@@ -1467,13 +1582,16 @@ function processFullStringRow(response, id, tag, row) {
       tag = response._chunks;
       (chunk = tag.get(id))
         ? triggerErrorOnChunk(chunk, row)
-        : tag.set(id, new Chunk("rejected", null, row, response));
+        : tag.set(id, createErrorChunk(response, row));
       break;
     default:
       (tag = response._chunks),
         (chunk = tag.get(id))
           ? resolveModelChunk(chunk, row)
-          : tag.set(id, new Chunk("resolved_model", row, null, response));
+          : tag.set(
+              id,
+              new ReactPromise("resolved_model", row, null, response)
+            );
   }
 }
 function createFromJSONCallback(response) {
@@ -1497,10 +1615,15 @@ function createFromJSONCallback(response) {
             (initializingHandler = value.parent),
             value.errored)
           )
-            (key = new Chunk("rejected", null, value.value, response)),
+            (key = createErrorChunk(response, value.value)),
               (key = createLazyChunkWrapper(key));
           else if (0 < value.deps) {
-            var blockedChunk = new Chunk("blocked", null, null, response);
+            var blockedChunk = new ReactPromise(
+              "blocked",
+              null,
+              null,
+              response
+            );
             value.value = key;
             value.chunk = blockedChunk;
             key = createLazyChunkWrapper(blockedChunk);
@@ -1516,10 +1639,15 @@ function noServerCall() {
     "Server Functions cannot be called during initial render. This would create a fetch waterfall. Try to use a Server Component to pass data to Client Components instead."
   );
 }
-exports.createFromNodeStream = function (stream, ssrManifest, options) {
+exports.createFromNodeStream = function (
+  stream,
+  serverConsumerManifest,
+  options
+) {
   var response = new ResponseInstance(
-    ssrManifest.moduleMap,
-    ssrManifest.moduleLoading,
+    serverConsumerManifest.moduleMap,
+    serverConsumerManifest.serverModuleMap,
+    serverConsumerManifest.moduleLoading,
     noServerCall,
     options ? options.encodeFormAction : void 0,
     options && "string" === typeof options.nonce ? options.nonce : void 0,
@@ -1647,6 +1775,7 @@ exports.createFromNodeStream = function (stream, ssrManifest, options) {
             86 === chunkLength
               ? ((i = chunkLength), (chunkLength = 2), rowLength++)
               : (64 < chunkLength && 91 > chunkLength) ||
+                  35 === chunkLength ||
                   114 === chunkLength ||
                   120 === chunkLength
                 ? ((i = chunkLength), (chunkLength = 3), rowLength++)
